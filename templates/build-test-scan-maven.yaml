@@ -1,0 +1,98 @@
+variables:
+  MAVEN_CACHE_FOLDER: $(Pipeline.Workspace)/.m2
+  MAVEN_OPTS: '-Dmaven.repo.local=$(MAVEN_CACHE_FOLDER)'
+  BUILD_NAME: 'com.cat.catos:$(Build.Repository.Name)'
+  BUILD_NUMBER: $[variables['Build.BuildNumber']]
+  BRANCH: $[replace(variables['Build.SourceBranch'], 'refs/heads/', '')]
+  BRANCH_SAFE: $[replace(replace(variables['Build.SourceBranch'], 'refs/heads/', ''),'/','+')]
+  SRC_PATH: "$(Build.SourcesDirectory)/$(Build.Repository.Name)"
+
+steps:
+- pwsh: |
+    [string] $buildName = "$(Build.Repository.Name)_$(BRANCH_SAFE)_$(BUILD_NUMBER)"
+    Write-Host "Setting the name of the build to '$buildName'."
+    Write-Host "##vso[build.updatebuildnumber]$buildName"
+    git clone -c http.extraheader="AUTHORIZATION: bearer $(System.AccessToken)" --branch $(BRANCH) $(Build.Repository.Uri) $(SRC_PATH)
+  displayName: 'Checkout Source Code'
+- task: Cache@2
+  inputs:
+    key: '"maven" | "$(Agent.OS)" | "$(Build.Repository.Name)"'
+    restoreKeys: |
+      "maven" | "$(Agent.OS)" | "$(Build.Repository.Name)"
+      "maven" | "$(Agent.OS)"
+      "maven"
+    path: $(MAVEN_CACHE_FOLDER)
+  displayName: Initialise Maven Cache
+- task: JavaToolInstaller@0
+  displayName: Initialise Java Tool
+  inputs:
+    jdkArchitectureOption: x64
+    jdkSourceOption: PreInstalled
+    versionSpec: '17'
+- task: AdvancedSecurity-Codeql-Init@1
+  displayName: Initialise CodeQL
+  inputs:
+    languages: 'java'
+    querysuite: 'security-and-quality'
+    sourcesfolder: $(SRC_PATH)
+# Run scanner and upload the results to the SonarQube server.
+- task: SonarQubePrepare@5
+  displayName: Initialise SonarQube
+  inputs:
+    SonarQube: 'SonarQube_GIS'
+    scannerMode: 'Other'
+    projectKey: 'com.cat.connectedworksite.minestar:$(Build.Repository.Name)'
+    projectName: '$(Build.Repository.Name)'
+- task: JFrogMaven@1
+  displayName: Build, Test + Scan
+  inputs:
+    mavenPomFile: '$(SRC_PATH)/pom.xml'
+    goals: 'clean deploy -P sonarqube sonar:sonar'
+    #goals: 'clean deploy'
+    artifactoryResolverService: 'JFrog Artifactory V2'
+    targetResolveReleaseRepo: 'cat-catos-maven-virt'
+    targetResolveSnapshotRepo: 'cat-catos-maven-virt'
+    artifactoryDeployService: 'JFrog Artifactory V2'
+    targetDeployReleaseRepo: 'cat-catos-maven-local'
+    targetDeploySnapshotRepo: 'cat-catos-maven-local'
+    collectBuildInfo: true
+    buildName: '$(BUILD_NAME)'
+    buildNumber: '$(BUILD_NUMBER)'
+    includeEnvVars: true
+    javaHomeOption: 'JDKVersion'
+
+- task: AdvancedSecurity-Dependency-Scanning@1
+  displayName: CodeQL Dependency Scan
+- task: AdvancedSecurity-Codeql-Analyze@1
+  displayName: CodeQL Analyze
+- task: AdvancedSecurity-Publish@1
+  displayName: Publish CodeQL Results
+- task: JFrogPublishBuildInfo@1
+  displayName: Publish Build Info
+  inputs:
+    artifactoryConnection: 'JFrog Artifactory V2'
+    buildName: '$(BUILD_NAME)'
+    buildNumber: '$(Build.BuildNumber)'
+- task: PublishTestResults@2
+  displayName: Publish Test Results
+  inputs:
+    testResultsFormat: 'JUnit'
+    testResultsFiles: '**/TEST-*.xml'
+    searchFolder: '$(SRC_PATH)'
+- task: SonarQubePublish@5
+  displayName: Publish SonarQube Results
+  inputs:
+    pollingTimeoutSec: '300'
+- pwsh: |
+    $jacocoFiles = gci -recurse -filter *.xml | ? { $_.FullName.contains("jacoco") }
+    Write-Output "##vso[task.setvariable variable=JaCoCoExists]$($jacocoFiles.Count -gt 0)"
+- task: PublishCodeCoverageResults@2
+  displayName: Publish Code Coverage
+  condition: eq(variables['JaCoCoExists'], True)
+  inputs:
+    summaryFileLocation: '**/jacoco-unit-test-coverage-report/*.xml'
+    pathToSources: '$(SRC_PATH)'
+#- task: sonar-buildbreaker@8
+#  displayName: SonarQube Quality Gate
+#  inputs:
+#    SonarQube: 'SonarQube_GIS'

@@ -1,0 +1,23 @@
+# Prevent changes to this pipeline triggering runs
+trigger: none
+
+# We only want changes to the following resources to trigger runs
+resources:
+  repositories:
+    - repository: <repo-alias>
+      type: git
+      name: '<project name>/<repository name>'
+      trigger:
+        branches:
+          include:
+            - release/* # eg: release/*, production/*, versions/* etc, whatever your team uses for versioned release builds
+        paths:
+          exclude:
+            # optional list of files and/or source paths to exclude from triggering the runs
+            - <file>
+            - <path>/
+    - repository: <...>
+      # repeat for all required repositories as ADO does not support repository wildcards
+
+jobs:
+  - template: auto-merge-template.yaml

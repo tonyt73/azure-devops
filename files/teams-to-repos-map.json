@@ -1,0 +1,12 @@
+{
+    "<repo name 1>": [
+      "<team 1>",
+      "<team 2>",
+      "..."
+    ],
+    "<repo name 2>": null,
+    "<repo name 3>": [
+        "..."
+    ]
+}
+  

@@ -1,0 +1,13 @@
+Release branch Auto-Merge conflict for Pull Request @PullRequestId by @User's merge to @SourceBranch
+
+Project: @ProjectName
+Repository: @RepositoryName
+Source Branch: @SourceBranch
+Target Branch: @TargetBranch
+
+@PullRequestUrl
+
+Teams emailed: @Teams
+
+
+.

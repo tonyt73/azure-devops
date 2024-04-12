@@ -1,0 +1,229 @@
+#
+# Release Change - Auto Merge Release
+#   Merges changes from old release branches down into the next semantically versioned release branch
+#   eg: given: 
+#     1.0.0, 1.0.1, 1.1.0, 1.2.0, 1.2.1, 1.2.2, main
+#     Changing 1.2.0
+#       1.2.0 -> 1.2.1 - 1.2.1 change triggers another run
+#       1.2.1 -> 1.2.2 - 1.2.2 change triggers another run
+#       1.2.2 -> main  - 1.2.0 change propagated to all future releases from 3 separate runs
+#
+# MarketPlace tasks:
+#   * https://github.com/shayki5/azure-devops-create-pr-task from marketplace
+#
+#
+# Process:
+#   * Use a windows vm as the 'create pr' task requires it
+#   * import the RestApi variable group
+#       Library/Variable Group: RestAPI
+#         Variables:
+#           RestApi.Token: The ADO token that allows calling the ADO Rest API
+#       Library/Variable Group: Teams
+#         Teams.Channel: The incoming webhook channel GUID
+#         Teams.Token  : The token for the Teams channel
+#       Library/Variable Group: Emails-AutoMerge
+#         Email.IsActive: true to send emails via WI mail
+#         Email.Message : Email message text (no MD or HMTL supported)
+#                         
+#         Email.Subject : Auto-Merge conflict on PR: $(pullRequestId) by $(Build.RequestedFor)
+#   * set the output file used to capture rest api output
+#
+#   Steps
+#     - Checkout ourselves (pipeline code)
+#     - Discover the target branch to merge the release branch changes into
+#     - Create the Pull Request between the 2 branches
+#     - Request the Pull Request details (RestApi)
+#         . output goes to the rest api file
+#     - Read the Rest api file (File)
+#         . get the PR id, status + commit URL
+#     - If PR status is Completed then we are done
+#       Else we have a conflict
+#     *** PR CONFLICT Notifications ***
+#     - Request the last committer details (RestApi)
+#     - Read the last committer details (File)
+#         . gives us their name and TFS id (for emails/chat mention)
+#     - Send MS TEAMS notification to the build channel
+#         . mention the user who created the conflict
+#     - Request the work items for the PR
+#         . Every remote commit push must be associated with a work item number
+#           So this list should not be empty
+#     - Send work item email
+#         . to: PR user, all developers of the teams that use the repo
+#         . subject: Auto-merge conflict from PR <no>
+#         . list all affected work items
+#     
+jobs:
+- job: job_auto_merge
+  displayName: Auto Merge of change to Release ${{ variables['Build.SourceBranchName'] }}
+  condition: not(contains(variables['Build.SourceVersionMessage'],'merge branch'))
+  pool:
+    vmImage: 'windows-latest'
+
+  variables:
+  - group: RestApi
+  - group: Teams
+  - group: Emails-AutoMerge
+  - name: apiResponseFile
+    value: $(Agent.HomeDirectory)\response.json
+  - name: apiUrl
+    value: $(System.CollectionUri)$(System.TeamProjectId)
+  - name: System.Debug
+    value: false
+
+  steps:
+  - checkout: self
+    fetchDepth: 1
+    fetchTags: false
+    displayName: Checkout Pipeline
+
+  - pwsh: |
+      Write-Host "Build.DefinitionName: $(Build.DefinitionName)"
+      Write-Host "Build.Reason: $(Build.Reason)"
+      Write-Host "Build.BuildId: $(Build.BuildId)"
+      Write-Host "Build.BuildNumber: $(Build.BuildNumber)"
+      Write-Host "Build.QueuedBy: $(Build.QueuedBy)"
+      Write-Host "Build.SourceVersionMessage: $(Build.SourceVersionMessage)"
+      Write-Host "##vso[task.setvariable variable=Skip]$false"
+      # find the target branch
+      $Organization = "$(System.CollectionUri)".Split('/',[System.StringSplitOptions]::RemoveEmptyEntries)[-1]
+      Write-Host "$organization > $(Build.Repository.ID) > $(Build.SourceBranch)"
+      $TargetBranch = ./scripts/findBranchToMergeTo.ps1 -Organization $Organization -RepositoryId $(Build.Repository.ID) -SourceBranch $(Build.SourceBranch) -Debug
+      Write-Host "Returned Target Branch: {$TargetBranch}"
+      Write-Host "##vso[task.setvariable variable=Organization]$Organization"
+      if ([string]::IsNullOrEmpty($TargetBranch)) {
+        # we don't want to do anything if the next version is a major version increment
+        # ie. we don't auto merge 1.0 -> 2.0 etc
+        Write-Host "##vso[task.setvariable variable=Skip]$true"
+        Write-Host "Skipping: A newer version is the next step from '$(Build.SourceBranch)' and we can't merge to it or the default branch"
+      }
+    displayName: Discover Target Branch
+    env:
+      # The token from the reat-api-token variable group, used to call the REST API with the correct credentials
+      # secrets can only be passed using $env: variables
+      REST_TOKEN: $(RestApi.Token)
+
+  - task: CreatePullRequest@1 
+    # Create a merge pull request and auto complete it if possible
+    displayName: Create Pull Request
+    condition: and(eq(variables['Skip'], 'False'), succeeded())
+    inputs:
+      title: "[Auto Merge] $(Build.SourceBranch) to $(TargetBranch)"
+      description: '[skip ci] Create auto merge Pull Request for $(Build.SourceBranch) into $(TargetBranch)'
+      repoType: Azure DevOps
+      repositorySelector: select
+      gitRepositoryId: $(Build.Repository.ID)
+      sourceBranch: $(Build.SourceBranch)
+      targetBranch: $(TargetBranch)
+      bypassPolicy: true
+      bypassReason: 'CI Auto Merge $(Build.SourceBranch) -> $(TargetBranch)'
+      linkWorkItems: true
+      mergeStrategy: noFastForward
+      alwaysCreatePr: false
+      autoComplete: true
+      deleteSourch: false
+      passPullRequestIdBackToADO: true
+    env:
+      # different to the rest api token, this token is bound to the builder service and is limited
+      System_AccessToken: $(System.AccessToken)
+
+  - pwsh: |
+      # Retrieve the Pull Request Id and store in a variable to pass to the next job
+      $pullRequestStatus = "completed"
+      if ("$(pullRequestId)" -eq "") {
+        # we failed to create a PR, so there "might" be an active one
+        $pullRequests = ./scripts/invoke-rest-api.ps1 -Uri "$(apiUrl)/_apis/git/repositories/$(Build.Repository.Id)/pullrequests?_a=active"
+        $pullRequest = $pullRequests.value | ? { "$($_.title)".startsWith("[Auto Merge]") }
+      } else {
+        # use the provided PR id as it could be active or completed
+        $pullRequest = ./scripts/invoke-rest-api.ps1 -Uri "$(apiUrl)/_apis/git/repositories/$(Build.Repository.ID)/pullrequests/$(pullRequestId)"
+      }
+      if (($pullRequest) -and (![string]::IsNullOrEmpty($pullRequest.status))) {
+        $pullRequestUrl = $pullRequest.url
+        Write-Host "pullRequestUrl = $pullRequestUrl"
+        $pullRequestStatus = $pullRequest.status.ToLower()
+        Write-Host "pullRequestStatus = $pullRequestStatus"
+      }
+      Write-Host "pullRequestId = $($pullRequest.pullRequestId)"
+      Write-Host "##vso[task.setvariable variable=PullRequestUrl]$pullRequestUrl"
+      Write-Host "##vso[task.setvariable variable=PullRequestStatus]$pullRequestStatus"
+      Write-Host "##vso[task.setvariable variable=PullRequestId;]$($pullRequest.pullRequestId)"
+    displayName: Get Pull Request Details
+    # last step was successful, pull request id is not blank
+    condition: and(eq(variables['Skip'], 'False'), succeeded())
+    env:
+      REST_TOKEN: $(RestApi.Token)
+ 
+  - task: PowerShell@2
+    # Send a teams notification if we have a the PR conflict
+    displayName: Conflict Notification
+    # last step was successful and pull request status is not completed
+    condition: and(eq(variables['Skip'], 'False'), and(succeeded(), and(ne(variables['PullRequestId'], ''), ne(variables['PullRequestStatus'], 'completed'))))
+    inputs:
+      pwsh: true
+      filePath: scripts/send-teams-notification.ps1
+      arguments:
+        -ActionTitle "Pull Request $(PullRequestId)"
+        -ActionUrl "$(apiUrl)/_git/$(Build.Repository.Name)/pullrequest/$(pullRequestId)"
+        -Title "Auto-Merge Conflict by <at>$(Build.RequestedFor)</at>"
+        -Message "<at>$(Build.RequestedFor)</at> has an Auto-Merge conflict for '$(Build.Repository.Name)'.   `nPlease manually resolve the conflict.   `nClick the [Complete] button to finalise the merge process."
+        -Channel "$(Teams.Channel)"
+        -UserName "$(Build.RequestedFor)"
+        -UserId "$(Build.RequestedForEmail)"
+    env:
+      REST_TOKEN: $(Teams.Token)
+
+  - pwsh: |
+      # Retrieve the Pull Request work items
+      $response = ./scripts/invoke-rest-api.ps1 -Uri "$(pullRequestUrl)/workitems?api-version=7.1-preview.1"
+      $workitems = ($response.value -eq $null ? $response : $response.value) | Select-Object -ExpandProperty id
+      Write-Host "WorkItems: $workitems"
+      # find the teams for the repo that has changes
+      $repos = Get-Content ./files/repo-to-teams.json | ConvertFrom-Json -AsHashtable
+      $repoTeams = $repos."$(Build.Repository.Name)"
+      if ($repoTeams -eq $null) {
+        # no specific teams found, all email them all
+        $repoTeams = $repos."all"
+      }
+      $repoTeams = $repoTeams -join ","
+      Write-Host "Repo: $(Build.Repository.Name) >> Teams: $repoTeams"
+      # not good if we don't find any work items
+      if ($workitems.count -eq 0) {
+        $workitems = @(454368)
+      }
+      if ($workitems.count -gt 0) {
+        # find the teams details (ie. id) from the name of the team in $repoTeams
+        $projectTeams = ./scripts/invoke-rest-api.ps1 -Uri "$(System.CollectionUri)_apis/projects/$(System.TeamProjectId)/teams?api-version=5.0"
+        $theTeams = $projectTeams.value | ? { $_.name -in $repoTeams }
+        # get all the members of the required teams to email
+        $allMembers = @()
+        $theTeams.ForEach({
+          $teamId = $_.id
+          # get all the members of the team
+          $members = ./scripts/invoke-rest-api.ps1 -Uri "$(System.CollectionUri)_apis/projects/$(System.TeamProjectId)/teams/$teamId/members?api-version=5.0"
+          $allMembers += $members.value.identity | Select-Object -ExpandProperty id
+        })
+        # remove duplicates members (from multiple teams)
+        $uniqueTeamMembers = $allMembers | Sort-Object -Unique
+        # if the subject or message contains a file, then read the file for the content
+        $message = "$(Email.Message)"
+        if (Test-Path $message) {
+          $message = (Get-Content $message) -Join '\r\n'
+          Write-Host "text: $message"
+          $message = $message.replace("@User", "$(Build.RequestedFor)")
+          $message = $message.replace("@ProjectName","$(System.TeamProject)")
+          $message = $message.replace("@RepositoryName","$(Build.Repository.Name)")
+          $message = $message.replace("@SourceBranch","$(Build.SourceBranch)")
+          $message = $message.replace("@TargetBranch","$(TargetBranch)")
+          $message = $message.replace("@PullRequestId", "$(PullRequestId)")
+          $message = $message.replace("@PullRequestUrl", "$(ApiUrl)/_git/$(Build.Repository.Name)/pullrequest/$(PullRequestId)")
+          $message = $message.replace("@Teams", "$repoTeams")
+        }
+        ./scripts/send-mail.ps1 -ToIds @("$(Build.RequestedForId)") -ToMails @("$(Build.RequestedForEmail)") -CcIds $uniqueTeamMembers -Subject "$(Email.Subject)" -Message "$message" -WorkItems $workitems -Organization "$(Organization)" -ProjectId "$(System.TeamProjectId)"
+      } else {
+        Write-Error "No Work items found"
+      }
+    displayName: Email Teams of Auto-Merge Conflict
+    # last step was successful and pull request status is not completed
+    condition: and(eq(variables['Skip'],'False'), and(eq(variables['Email.IsActive'], 'true'), and(ne(variables['PullRequestId'], ''), ne(variables['PullRequestStatus'], 'completed'))))
+    env:
+      REST_TOKEN: $(RestApi.Token)
